@@ -1,0 +1,521 @@
+tosca_definitions_version: tosca_simple_yaml_1_3
+
+imports:
+  - modules/openstack/openstack_vm.yaml
+  - modules/docker/docker_host.yaml
+  - modules/docker/docker_network.yaml
+  - modules/docker/docker_registry.yaml
+  - modules/docker/docker_component.yaml
+  - modules/docker/docker_certificate.yaml
+  - modules/misc/ssh/types.yaml
+  - library/prometheus/prometheus_config.yaml
+
+node_types:
+
+  sodalite.nodes.SodaliteVM:
+    derived_from: tosca.nodes.Compute
+    properties:
+      username:
+        type: string
+
+
+topology_template:
+
+  inputs:  
+    username:  
+      type: string 
+    docker-registry-ip:  
+      type: string 
+    docker-network: 
+      type: string
+    dockerhub-user:
+      type: string
+      default: ""      
+    dockerhub-pass: 
+      type: string
+      default: "" 
+    docker-public-registry-url: 
+      type: string
+      default: ""
+    docker-private-registry-url: 
+      type: string
+      default: ""
+    docker-registry-cert-country-name:
+      type: string
+      default: ""
+    docker-registry-cert-organization-name: 
+      type: string
+      default: ""
+    docker-registry-cert-email-address: 
+      type: string
+      default: ""
+    postgres_env:
+      type: map
+    xopera_env:
+      type: map
+    image_builder_env:
+      type: map  
+
+  node_templates: 
+
+    sodalite-vm:
+      type: sodalite.nodes.SodaliteVM
+      properties:
+        username: { get_input: username }
+      attributes:
+        private_address: localhost
+        public_address: localhost
+
+    docker-host:
+      type: sodalite.nodes.DockerHost
+      requirements:
+        - host: sodalite-vm
+
+    docker-network:
+      type: sodalite.nodes.DockerNetwork
+      properties:  
+        name: { get_input: docker-network }
+      requirements:
+        - host: sodalite-vm 
+        - dependency: docker-host    
+        
+    docker-public-registry:
+      type: sodalite.nodes.DockerRegistry
+      properties:  
+        docker_registry_url: { get_input: docker-public-registry-url } 
+      requirements:
+        - host: sodalite-vm
+        - dependency: docker-host 
+
+    docker-registry-certificate:
+      type: sodalite.nodes.RegistryCertificate
+      properties:  
+        registry_ip:         { get_input: docker-private-registry-url }
+        country_name:        { get_input: docker-registry-cert-country-name }
+        organization_name:   { get_input: docker-registry-cert-organization-name }
+        email_address:       { get_input: docker-registry-cert-email-address }
+        cert_path: "/home/xopera/certs/"
+        cert_files_prefix: "image.docker.local"
+      requirements:
+        - host: sodalite-vm 
+        - dependency: docker-host        
+
+    # xopera-rest-api
+    # https://github.com/SODALITE-EU/xopera-rest-api        
+    xopera-openstack-keys:
+      type: sodalite.nodes.ConfigureKeys
+      requirements:
+        - host: sodalite-vm
+
+    xopera-postgres-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        image_name: library/postgres:latest
+        volumes:
+          - "/home/postgres:/var/lib/postgresql/data"
+        ports: ['5432:5432']
+        alias: xopera-postgres
+        env: { get_input: postgres_env }
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+      requirements:
+        - host:  docker-host
+        - network: docker-network
+        - registry: docker-public-registry 
+
+    xopera-flask-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: xopera-flask
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        image_name: sodaliteh2020/xopera-flask
+        restart_policy: always
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
+          - "/root/.ssh/:/root/.ssh/"
+          - "/home/xopera/certs:/home/xopera/certs"
+        exposed_ports:  ['5000']
+        env: { get_input: xopera_env }
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry  
+        - network: docker-network 
+        - dependency: xopera-openstack-keys
+        - dependency: xopera-postgres-container
+        - dependency: docker-registry-certificate
+
+    xopera-nginx-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: xopera-nginx
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        image_name: sodaliteh2020/xopera-nginx
+        restart_policy: always
+        ports:  ['5001:443', '5000:80']
+        #exposed_ports:  ['443', '5000']
+        volumes:
+          - "/home/xopera/certs:/etc/nginx/certs"
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry   
+        - network: docker-network           
+        - dependency: xopera-flask-container
+        - dependency: docker-registry-certificate
+
+    #image registry
+    docker-registry-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: registry
+        image_name: library/registry:2
+        ports:
+          - "443:443"
+        #TODO
+        #get filenames from docker-registry-certificate
+        ca_cert: "/certs/ca.crt"
+        client_cert: "/certs/image.docker.local.crt"
+        client_key: "/certs/image.docker.local.key"
+        etc_hosts:
+          registry.docker.local: 127.0.0.1
+        volumes:
+          - "/home/localregistry/registry:/var/lib/registry"
+          - "/home/xopera/certs:/certs"
+        env:
+          REGISTRY_HTTP_ADDR: 0.0.0.0:443
+          REGISTRY_HTTP_TLS_CLIENTCAS: "[/certs/ca.crt]"
+          REGISTRY_HTTP_TLS_CERTIFICATE: "/certs/image.docker.local.crt"
+          REGISTRY_HTTP_TLS_KEY: "/certs/image.docker.local.key"
+        docker_network_name:  { get_property: [ SELF, network, name ] }  
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry   
+        - network: docker-network   
+        - dependency: docker-registry-certificate 
+
+    # iac-blueprint-builder 
+    # https://github.com/SODALITE-EU/iac-blueprint-builder 
+    iac-builder-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: iac-builder
+        image_name: sodaliteh2020/iac-blueprint-builder
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        restart_policy: always
+        ports: 
+          - "8081:80"
+        env:
+          XOPERA_ENDPOINT: http://xopera-nginx:80
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry 
+        - network: docker-network    
+        - dependency: xopera-nginx-container
+
+    # image-builder     
+    # https://github.com/SODALITE-EU/image-builder  
+    image-builder-flask:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        image_name:  sodaliteh2020/image-builder-flask
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        exposed_ports:  ['5000']
+        env: { get_input: image_builder_env }
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
+        alias: image-builder-flask
+      requirements:
+        - host:  docker-host
+        - registry: docker-public-registry 
+        - network: docker-network
+
+    image-builder-nginx:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        image_name: sodaliteh2020/image-builder-nginx
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        ports:  ['5002:443']
+        #exposed_ports:  ['443']
+        volumes:
+          - "/home/xopera/certs:/etc/nginx/certs"
+        alias: image-builder-nginx
+      requirements:
+        - host:  docker-host
+        - dependency: image-builder-flask
+        - network: docker-network 
+        - registry: docker-public-registry 
+        - dependency: docker-registry-certificate
+
+    # semantic-reasoner     
+    # https://github.com/SODALITE-EU/semantic-reasoner 
+    know-db-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: graph-db
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        image_name: sodaliteh2020/graph_db
+        restart_policy: always
+        ports:  ['7200:7200']
+        exposed_ports:  ['7200']
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry   
+        - network: docker-network      
+
+    semantic-web-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: semantic-web
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        image_name: sodaliteh2020/semantic_web
+        restart_policy: always
+        env:
+          WAIT_HOSTS: graph-db:7200
+          environment: docker
+          graphdb:  http://graph-db:7200
+          bugPredictorServer:  http://tosca-smells:8080/  
+          ansiblePath: /usr/local/tomcat/webapps/Ansibles/
+          reasonerServer: http://semantic-web:8080/
+        ports:  ['8080:8080']
+        volumes:
+          - "/tmp/tomcat/webapps/Ansibles:/usr/local/tomcat/webapps/Ansibles"   
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry   
+        - network: docker-network     
+        - dependency: know-db-container
+        - dependency: tosca-smells-container
+
+    # iac-quality-framework   
+    # https://github.com/SODALITE-EU/iac-quality-framework
+    iac-metrics-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: iac-metrics
+        image_name: sodaliteh2020/iacmetrics
+        restart_policy: always
+        ports:  ['5003:5000']
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry   
+     
+    # defect-prediction      
+    # https://github.com/SODALITE-EU/defect-prediction         
+    tosca-smells-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: tosca-smells
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        image_name: sodaliteh2020/toscasmells
+        restart_policy: always
+        env:
+          environment: docker
+          WAIT_HOSTS: graph-db:7200
+          graphdb: http://graph-db:7200
+        ports:  ['8082:8080']
+        exposed_ports:  ['8080']
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry  
+        - dependency: know-db-container
+        - network: docker-network 
+
+    ansible-smells-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: ansible-smells
+        image_name: sodaliteh2020/ansiblesmells
+        restart_policy: always
+        ports:  ['5004:5000']
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry          
+
+    # verification    
+    # https://github.com/SODALITE-EU/verification 
+    tosca-syntax-verifier-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: tosca-syntax
+        image_name: sodaliteh2020/toscasynverifier
+        restart_policy: always
+        ports:  ['5005:5000']
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry           
+
+    workflow-verifier-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: workflow-verifier
+        image_name: sodaliteh2020/workflowverifier
+        restart_policy: always
+        ports:  ['5006:5000']
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry           
+
+    # refactoring-ml
+    # https://github.com/SODALITE-EU/refactoring-ml      
+    rule-based-refactorer-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: rule-based-refactorer
+        image_name: sodaliteh2020/rule_based_refactorer
+        restart_policy: always
+        ports:  ['8083:8080']
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        env:  
+          prometheus: http://prometheus:9090
+          xopera: http://xopera-nginx:5000
+          refacopdiscoverer: http://refactoring-option-discoverer:8080
+          perfpredictor: http://performance-predictor-refactoring:5000
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry 
+        - network: docker-network   
+        - dependency: xopera-nginx-container
+        - dependency: performance-predictor-refactoring-container
+        - dependency: refactoring-option-discoverer-container
+        
+    performance-predictor-refactoring-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: performance-predictor-refactoring
+        image_name: sodaliteh2020/fo_perf_predictor_api
+        restart_policy: always
+        ports:  ['5007:5000']
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        env:  
+          prometheus: http://prometheus:9090
+          xopera: http://xopera-nginx:5000
+          refacopdiscoverer: http://refactoring-option-discoverer:8080
+          perfpredictor: http://performance-predictor-refactoring:5000
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry 
+        - network: docker-network  
+        - dependency: xopera-nginx-container
+        - dependency: refactoring-option-discoverer-container
+
+    # https://github.com/SODALITE-EU/refactoring-option-discoverer
+    refactoring-option-discoverer-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: refactoring-option-discoverer
+        image_name: sodaliteh2020/refactoring_option_discoverer
+        restart_policy: always
+        ports:  ['8084:8080']
+        env:
+          graphdb: http://graph-db:7200
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry  
+        - network: docker-network         
+        - dependency: know-db-container
+
+    # monitoring-system
+    # https://github.com/SODALITE-EU/monitoring-system
+    prometheus_config:
+      type: sodalite.nodes.skydive-connector.config
+      properties:
+        dest: /tmp/prometheus/prometheus.yml
+        #target_address: http://prometheus-skydive-connector:9100
+        target_address: prometheus-skydive-connector:9100
+      requirements:
+        - dependency: prometheus-skydive-connector
+
+    prometheus-container:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: prometheus
+        image_name: prom/prometheus:latest
+        restart_policy: always
+        ports:  ['9090:9090']
+        exposed_ports:  ['9090']
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        volumes:
+          - "/tmp/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry
+        - network: docker-network
+        - dependency: prometheus_config
+
+    # skydive-analyzer
+    # https://github.com/skydive-project/skydive
+    skydive-analyzer:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        image_name:  skydive/skydive
+        command: analyzer
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        ports:  ['8088:8082', '8088:8082/udp']
+        alias: skydive-analyzer
+      requirements:
+        - host:  docker-host
+        - registry: docker-public-registry
+        - network: docker-network
+
+    # skydive-capture
+    # https://github.com/skydive-project/skydive
+    skydive-capture:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        image_name:  skydive/skydive
+        command: client capture create --extra-tcp-metric --gremlin "G.V()"
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        env:
+          SKYDIVE_ANALYZERS: skydive-analyzer:8082
+        alias: skydive-capture
+      requirements:
+        - host:  docker-host
+        - registry: docker-public-registry
+        - network: docker-network
+        - dependency: skydive-analyzer
+
+    # prometheus-skydive-connector
+    # https://github.com/SODALITE-EU/skydive-flow-exporter/prom_sky_con
+    prometheus-skydive-connector:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        image_name: sodaliteh2020/prometheus-skydive-connector
+        command: /etc/prom_sky_con.yml
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        env:
+          SKYDIVE_PIPELINE_SUBSCRIBER_URL: ws://skydive-analyzer:8082/ws/subscriber/flow
+        ports:  ['9101:9100']
+        alias: prometheus-skydive-connector
+      requirements:
+        - host:  docker-host
+        - registry: docker-public-registry
+        - network: docker-network
+
+    # IDE    
+    # https://github.com/SODALITE-EU/ide   
+    # requires X11 system     
+    # ide-config:
+    #   type: sodalite.nodes.Configuration.IDE
+    #   properties:
+    #     dir: /tmp
+    #     filename: sodalite.properties
+    #     iac_blueprint_builder_endpoint: iac-builder:80       
+    #     semantic_web_endpoint: semantic-web:8080                 
+    #     xopera_endpoint: xopera-nginx:5000            
+    #   requirements:
+    #     - host: sodalite-vm   
+    
+    # ide-container:
+    #   type: sodalite.nodes.DockerizedComponent
+    #   properties:
+    #     image_name: sodaliteh2020/sodalite-ide
+    #     docker_network_name:  { get_property: [ SELF, network, name ] }
+    #     volumes:
+    #       - "/tmp/.X11-unix:/tmp/.X11-unix"   
+    #       - /tmp/sodalite.properties:/sodalite/eclipse/sodalite.properties     
+    #     alias: sodalite-ide
+    #     env: 
+    #       DISPLAY=:0
+    #   requirements:
+    #     - host: docker-host
+    #     - registry: docker-public-registry  
+    #     - network: docker-network         
