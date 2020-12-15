@@ -18,7 +18,6 @@ node_types:
       username:
         type: string
 
-
 topology_template:
 
   inputs:  
@@ -99,6 +98,14 @@ topology_template:
       requirements:
         - host: sodalite-vm 
         - dependency: docker-host        
+
+    #docker-local-registry:
+    #  type: sodalite.nodes.DockerRegistry
+    #  properties:  
+    #    docker_registry_url: localhost:5555
+    #  requirements:
+    #    - host: sodalite-vm
+    #    - dependency: docker-host 
 
     # xopera-rest-api
     # https://github.com/SODALITE-EU/xopera-rest-api        
@@ -413,34 +420,6 @@ topology_template:
         - network: docker-network         
         - dependency: know-db-container
 
-    # monitoring-system
-    # https://github.com/SODALITE-EU/monitoring-system
-    prometheus_config:
-      type: sodalite.nodes.skydive-connector.config
-      properties:
-        dest: /tmp/prometheus/prometheus.yml
-        #target_address: http://prometheus-skydive-connector:9100
-        target_address: prometheus-skydive-connector:9100
-      requirements:
-        - dependency: prometheus-skydive-connector
-
-    prometheus-container:
-      type: sodalite.nodes.DockerizedComponent
-      properties:
-        alias: prometheus
-        image_name: prom/prometheus:latest
-        restart_policy: always
-        ports:  ['9090:9090']
-        exposed_ports:  ['9090']
-        docker_network_name:  { get_property: [ SELF, network, name ] }
-        volumes:
-          - "/tmp/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"
-      requirements:
-        - host: docker-host
-        - registry: docker-public-registry
-        - network: docker-network
-        - dependency: prometheus_config
-
     # skydive-analyzer
     # https://github.com/skydive-project/skydive
     skydive-analyzer:
@@ -467,6 +446,7 @@ topology_template:
         env:
           SKYDIVE_ANALYZERS: skydive-analyzer:8082
         alias: skydive-capture
+        restart_policy: "no"
       requirements:
         - host:  docker-host
         - registry: docker-public-registry
@@ -489,6 +469,84 @@ topology_template:
         - host:  docker-host
         - registry: docker-public-registry
         - network: docker-network
+
+    # MONITORING-SYSTEM
+
+    monitoring-system-consul:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: consul
+        image_name: library/consul:latest
+        restart_policy: always
+        ports:  ['8500:8500','8600:8600/udp']
+        exposed_ports:  ['8500','8600/udp']
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry  
+        - network: docker-network
+
+    monitoring-system-alertmanager:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: alertmanager
+        image_name: prom/alertmanager
+        restart_policy: always
+        ports:  ['9093:9093']
+        exposed_ports:  ['9093']
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry  
+        - network: docker-network
+
+    prometheus-config:
+      type: sodalite.nodes.monitoring-system-prometheus.config
+      properties:
+        dest: /tmp/prometheus/prometheus.yml
+        alertmanager_endpoint: alertmanager:9093
+        consul_endpoint: consul:8500
+      requirements:
+        - dependency: monitoring-system-alertmanager
+        - dependency: monitoring-system-consul
+
+    monitoring-system-prometheus:
+      type: sodalite.nodes.DockerizedComponent
+      properties:
+        alias: prometheus
+        image_name: prom/prometheus
+        restart_policy: always
+        ports:  ['9090:9090']
+        exposed_ports:  ['9090']
+        docker_network_name:  { get_property: [ SELF, network, name ] }
+        volumes:
+          - "/tmp/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"
+          - rules-volume:/etc/prometheus/rules
+      requirements:
+        - host: docker-host
+        - registry: docker-public-registry  
+        - network: docker-network         
+        - configuration: prometheus-config
+
+    #monitoring-system-ruleserver:
+    #  type: sodalite.nodes.DockerizedComponent
+    #  properties:
+    #    image_name: ruleserver
+    #    restart_policy: always
+    #    ports:  ['9092:9092']
+    #    exposed_ports:  ['9092']
+    #    docker_network_name:  { get_property: [ SELF, network, name ] }
+    #    env:
+    #      GUNICORN_WORKERS: "8"
+    #    volumes:
+    #      - "/var/run/docker.sock:/var/run/docker.sock"
+    #      - rules-volume:/etc/prometheus/rules
+    #    alias: ruleserver
+    #  requirements:
+    #    - host: docker-host
+    #    - network: docker-network
+    #    - registry: docker-local-registry
+    #    - dependency: monitoring-system-prometheus
 
     # IDE    
     # https://github.com/SODALITE-EU/ide   
